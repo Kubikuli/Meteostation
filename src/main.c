@@ -4,9 +4,19 @@
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "driver/i2c.h"
 #include "esp_log.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "esp_mac.h"
+#include "esp_system.h"
 #include "u8g2.h"
+#include "mqtt_client.h"
+#include "esp_netif_types.h"
 
 #define TAG "Meteostation"
 
@@ -17,6 +27,62 @@
 #define DISPLAY_ADDR CONFIG_I2C_DISPLAY_ADDRESS
 
 #define SHT31_ADDR 0x44     //< SHT31 I2C address
+
+#ifndef CONFIG_WIFI_SSID
+#define CONFIG_WIFI_SSID "Dolezal WiFi"
+#endif
+#ifndef CONFIG_WIFI_PASSWORD
+#define CONFIG_WIFI_PASSWORD "zachod269.@@"
+#endif
+
+#define WIFI_CONNECT_TIMEOUT_MS 20000
+
+#ifndef CONFIG_MQTT_BROKER_URI
+#define CONFIG_MQTT_BROKER_URI "mqtt://broker.hivemq.com:1883"
+#endif
+#ifndef CONFIG_MQTT_TOPIC
+#define CONFIG_MQTT_TOPIC "meteostanice/measurements"
+#endif
+
+static EventGroupHandle_t s_wifi_events;
+static const int WIFI_CONNECTED_BIT = BIT0;
+static esp_mqtt_client_handle_t s_mqtt = NULL;
+// No portal: Wi-Fi credentials come from macros
+
+static void draw_status(u8g2_t *u8g2, const char *line1, const char *line2) {
+    u8g2_ClearBuffer(u8g2);
+    u8g2_SetFont(u8g2, u8g2_font_6x10_tf);
+    if (line1) u8g2_DrawStr(u8g2, 2, 14, line1);
+    if (line2) u8g2_DrawStr(u8g2, 2, 28, line2);
+    u8g2_SendBuffer(u8g2);
+}
+
+static void mqtt_publish(float temp, float hum) {
+    if (!s_mqtt) return;
+    char payload[128];
+    snprintf(payload, sizeof(payload), "{\"temp_c\":%.2f,\"rh\":%.2f}", temp, hum);
+    esp_mqtt_client_publish(s_mqtt, CONFIG_MQTT_TOPIC, payload, 0, 1, 0);
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    if (base == WIFI_EVENT) {
+        switch (id) {
+            case WIFI_EVENT_STA_START:
+                esp_wifi_connect();
+                break;
+            case WIFI_EVENT_STA_DISCONNECTED:
+                xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
+                esp_wifi_connect();
+                break;
+            default:
+                break;
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
+    }
+}
+
+// Portal and provisioning removed; minimal MQTT publisher
 
 static uint8_t i2c_buffer[256];
 
@@ -113,7 +179,16 @@ void display_progress_bar(u8g2_t *u8g2) {
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "Starting I2C display + SHT31");
+    ESP_LOGI(TAG, "Starting Meteostation with Wi-Fi + MQTT");
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(esp_netif_init());
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+    s_wifi_events = xEventGroupCreate();
     
     // Configure I2C
     i2c_config_t i2c_config = {
@@ -133,6 +208,36 @@ void app_main(void) {
     u8x8_SetI2CAddress(&u8g2.u8x8, DISPLAY_ADDR << 1);
     u8g2_InitDisplay(&u8g2);
     u8g2_SetPowerSave(&u8g2, 0);
+
+    // Simple Wi-Fi STA connect using configured SSID/PASS
+    wifi_config_t sta = {0};
+    strncpy((char*)sta.sta.ssid, CONFIG_WIFI_SSID, sizeof(sta.sta.ssid));
+    strncpy((char*)sta.sta.password, CONFIG_WIFI_PASSWORD, sizeof(sta.sta.password));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    draw_status(&u8g2, "Wi-Fi connecting...", NULL);
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+    if ((bits & WIFI_CONNECTED_BIT) == 0) {
+        draw_status(&u8g2, "Wi-Fi failed", "Check SSID/PASS");
+    }
+
+    // Block until connected (best-effort)
+    while ((xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if ((xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT) != 0) {
+        draw_status(&u8g2, "Wi-Fi connected", NULL);
+    }
+
+    // MQTT client setup
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = CONFIG_MQTT_BROKER_URI,
+    };
+    s_mqtt = esp_mqtt_client_init(&mqtt_cfg);
+    if (s_mqtt) {
+        esp_mqtt_client_start(s_mqtt);
+    }
 
     while (1) {
         // Read SHT31
@@ -218,6 +323,7 @@ void app_main(void) {
         u8g2_SendBuffer(&u8g2);
 
         ESP_LOGI(TAG, "T=%.2fC RH=%.2f%%", temp, hum);
+        mqtt_publish(temp, hum);
 
         // Wait 3 seconds with progress bar
         display_progress_bar(&u8g2);
