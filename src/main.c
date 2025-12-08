@@ -11,12 +11,13 @@
 #include "nvs_flash.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
-#include "esp_timer.h"
 #include "esp_mac.h"
 #include "esp_system.h"
 #include "u8g2.h"
 #include "mqtt_client.h"
-#include "esp_netif_types.h"
+#include "esp_http_server.h"
+#include "esp_netif_ip_addr.h"
+#include "lwip/ip4_addr.h"
 
 #define TAG "Meteostation"
 
@@ -28,14 +29,11 @@
 
 #define SHT31_ADDR 0x44     //< SHT31 I2C address
 
-#ifndef CONFIG_WIFI_SSID
-#define CONFIG_WIFI_SSID "Dolezal WiFi"
-#endif
-#ifndef CONFIG_WIFI_PASSWORD
-#define CONFIG_WIFI_PASSWORD "zachod269.@@"
+#ifndef CONFIG_AP_SSID
+#define CONFIG_AP_SSID "ESP_Config"
 #endif
 
-#define WIFI_CONNECT_TIMEOUT_MS 20000
+#define WIFI_CONNECT_TIMEOUT_MS 10000
 
 #ifndef CONFIG_MQTT_BROKER_URI
 #define CONFIG_MQTT_BROKER_URI "mqtt://broker.hivemq.com:1883"
@@ -47,7 +45,138 @@
 static EventGroupHandle_t s_wifi_events;
 static const int WIFI_CONNECTED_BIT = BIT0;
 static esp_mqtt_client_handle_t s_mqtt = NULL;
-// No portal: Wi-Fi credentials come from macros
+static httpd_handle_t s_http = NULL;
+static esp_netif_t *s_ap_netif = NULL;
+static volatile bool s_skip_no_mqtt = false; // set when user chooses to run without MQTT via portal
+
+static bool load_wifi_creds(char *out_ssid, size_t ssid_len, char *out_pass, size_t pass_len) {
+    nvs_handle_t nvh;
+    if (nvs_open("wifi", NVS_READONLY, &nvh) != ESP_OK) return false;
+    size_t len_ssid = ssid_len;
+    size_t len_pass = pass_len;
+    esp_err_t er1 = nvs_get_str(nvh, "ssid", out_ssid, &len_ssid);
+    esp_err_t er2 = nvs_get_str(nvh, "pass", out_pass, &len_pass);
+    nvs_close(nvh);
+    if (er1 == ESP_OK && er2 == ESP_OK && out_ssid[0] != '\0') return true;
+    return false;
+}
+
+static esp_err_t root_get_handler(httpd_req_t *req) {
+    const char *html =
+        "<html><head><meta name=viewport content=\"width=device-width, initial-scale=1\"></head><body>"
+        "<h3>Wi-Fi Setup</h3>"
+        "<form method='POST' action='/save'>"
+        "SSID: <input name='ssid'><br>"
+        "Password: <input name='pass' type='password'><br>"
+        "<button type='submit'>Save</button>"
+        "</form>"
+        "<hr>"
+        "<form method='GET' action='/skip'>"
+        "<button type='submit'>Run without MQTT</button>"
+        "</form>"
+        "<p>This starts the thermometer without Wi‑Fi/MQTT.</p>"
+        "</body></html>";
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
+
+// Minimal URL decoder for '+' and %HH used after query extraction
+static void urldecode(char *s) {
+    char *src = s, *dst = s;
+    while (*src) {
+        if (*src == '+') { *dst++ = ' '; src++; }
+        else if (*src == '%' && src[1] && src[2]) {
+            int hi = src[1];
+            int lo = src[2];
+            hi = (hi >= '0' && hi <= '9') ? hi - '0' : (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10 : -1;
+            lo = (lo >= '0' && lo <= '9') ? lo - '0' : (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10 : -1;
+            if (hi >= 0 && lo >= 0) { *dst++ = (char)((hi << 4) | lo); src += 3; }
+            else { *dst++ = *src++; }
+        } else { *dst++ = *src++; }
+    }
+    *dst = '\0';
+}
+
+static esp_err_t save_post_handler(httpd_req_t *req) {
+    char buf[160];
+    int received = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No data");
+        return ESP_FAIL;
+    }
+    buf[received] = '\0';
+    char ssid[64] = {0}, pass[64] = {0};
+
+    /* httpd_query_key_value works on any key=value&key2=value2 string.
+       For application/x-www-form-urlencoded POST bodies, we can reuse it
+       to extract decoded values without custom parsing. */
+    (void)httpd_query_key_value(buf, "ssid", ssid, sizeof(ssid));
+    (void)httpd_query_key_value(buf, "pass", pass, sizeof(pass));
+    urldecode(ssid);
+    urldecode(pass);
+
+    ESP_LOGI(TAG, "Saving Wi-Fi credentials: SSID='%s', PASS='%s'", ssid, pass);
+
+    nvs_handle_t nvh;
+    if (nvs_open("wifi", NVS_READWRITE, &nvh) == ESP_OK) {
+        nvs_set_str(nvh, "ssid", ssid);
+        nvs_set_str(nvh, "pass", pass);
+        nvs_commit(nvh);
+        nvs_close(nvh);
+    }
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, "<p>Saved. Rebooting...</p>", HTTPD_RESP_USE_STRLEN);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_restart();
+    return ESP_OK;
+}
+
+static esp_err_t skip_get_handler(httpd_req_t *req) {
+    s_skip_no_mqtt = true;
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, "<p>Starting without MQTT...</p>", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static void start_config_portal(void) {
+    s_ap_netif = esp_netif_create_default_wifi_ap();
+    // 192.168.4.1/24
+    esp_netif_ip_info_t ip_info = {0};
+    ip4_addr_t t;
+    IP4_ADDR(&t, 192, 168, 4, 1); ip_info.ip.addr = t.addr;
+    IP4_ADDR(&t, 192, 168, 4, 1); ip_info.gw.addr = t.addr;
+    IP4_ADDR(&t, 255, 255, 255, 0); ip_info.netmask.addr = t.addr;
+    esp_netif_dhcps_stop(s_ap_netif);
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(s_ap_netif, &ip_info));
+    ESP_ERROR_CHECK(esp_netif_dhcps_start(s_ap_netif));
+
+    wifi_config_t ap_cfg = {0};
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    char ap_ssid[32];
+    snprintf(ap_ssid, sizeof(ap_ssid), "%s-%02X%02X", CONFIG_AP_SSID, mac[4], mac[5]);
+    strncpy((char*)ap_cfg.ap.ssid, ap_ssid, sizeof(ap_cfg.ap.ssid) - 1);
+    ap_cfg.ap.ssid_len = strlen((char*)ap_cfg.ap.ssid);
+    ap_cfg.ap.channel = 1;
+    ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+    ap_cfg.ap.max_connection = 4;
+    ap_cfg.ap.beacon_interval = 100;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    httpd_config_t conf = HTTPD_DEFAULT_CONFIG();
+    conf.server_port = 80;
+    ESP_ERROR_CHECK(httpd_start(&s_http, &conf));
+
+    httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(s_http, &root);
+    httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(s_http, &save);
+    httpd_uri_t skip = { .uri = "/skip", .method = HTTP_GET, .handler = skip_get_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(s_http, &skip);
+}
 
 static void draw_status(u8g2_t *u8g2, const char *line1, const char *line2) {
     u8g2_ClearBuffer(u8g2);
@@ -57,10 +186,27 @@ static void draw_status(u8g2_t *u8g2, const char *line1, const char *line2) {
     u8g2_SendBuffer(u8g2);
 }
 
+static void start_portal_and_block(u8g2_t *u8g2) {
+    draw_status(u8g2, "Open portal", "Connect to AP");
+    if (s_http) { httpd_stop(s_http); s_http = NULL; }
+    start_config_portal();
+    char line1[40];
+    snprintf(line1, sizeof(line1), "SSID: %s", CONFIG_AP_SSID);
+    draw_status(u8g2, line1, "http://192.168.4.1");
+    while (!s_skip_no_mqtt) { vTaskDelay(pdMS_TO_TICKS(200)); }
+    if (s_http) { httpd_stop(s_http); s_http = NULL; }
+    if (s_ap_netif) {
+        esp_wifi_stop();
+        esp_wifi_set_mode(WIFI_MODE_NULL);
+        esp_netif_destroy(s_ap_netif);
+        s_ap_netif = NULL;
+    }
+}
+
 static void mqtt_publish(float temp, float hum) {
     if (!s_mqtt) return;
     char payload[128];
-    snprintf(payload, sizeof(payload), "{\"temp_c\":%.2f,\"rh\":%.2f}", temp, hum);
+    snprintf(payload, sizeof(payload), "{\"temp_c\":%.2f,\"hum\":%.2f}", temp, hum);
     esp_mqtt_client_publish(s_mqtt, CONFIG_MQTT_TOPIC, payload, 0, 1, 0);
 }
 
@@ -81,8 +227,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
     }
 }
-
-// Portal and provisioning removed; minimal MQTT publisher
 
 static uint8_t i2c_buffer[256];
 
@@ -180,6 +324,8 @@ void display_progress_bar(u8g2_t *u8g2) {
 
 void app_main(void) {
     ESP_LOGI(TAG, "Starting Meteostation with Wi-Fi + MQTT");
+    // ESP_LOGW(TAG, "TESTING: Erasing NVS at boot");
+    // ESP_ERROR_CHECK(nvs_flash_erase());
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(esp_netif_init());
@@ -209,34 +355,43 @@ void app_main(void) {
     u8g2_InitDisplay(&u8g2);
     u8g2_SetPowerSave(&u8g2, 0);
 
-    // Simple Wi-Fi STA connect using configured SSID/PASS
-    wifi_config_t sta = {0};
-    strncpy((char*)sta.sta.ssid, CONFIG_WIFI_SSID, sizeof(sta.sta.ssid));
-    strncpy((char*)sta.sta.password, CONFIG_WIFI_PASSWORD, sizeof(sta.sta.password));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    draw_status(&u8g2, "Wi-Fi connecting...", NULL);
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
-    if ((bits & WIFI_CONNECTED_BIT) == 0) {
-        draw_status(&u8g2, "Wi-Fi failed", "Check SSID/PASS");
+    // Load stored credentials from NVS (provisioning portal)
+    char ssid[64] = {0}, pass[64] = {0};
+    bool have_nvs = load_wifi_creds(ssid, sizeof(ssid), pass, sizeof(pass));
+    if (!have_nvs) {
+        // No credentials found; start config portal immediately
+        start_portal_and_block(&u8g2);
     }
 
-    // Block until connected (best-effort)
-    while ((xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT) == 0) {
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    if ((xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT) != 0) {
-        draw_status(&u8g2, "Wi-Fi connected", NULL);
-    }
+    if (!s_skip_no_mqtt) {
+        // Try Wi‑Fi STA connect; if fails, open config portal
+        wifi_config_t sta = {0};
+        strncpy((char*)sta.sta.ssid, ssid, sizeof(sta.sta.ssid));
+        strncpy((char*)sta.sta.password, pass, sizeof(sta.sta.password));
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
+        ESP_ERROR_CHECK(esp_wifi_start());
+        draw_status(&u8g2, "Wi-Fi connecting...", NULL);
+        EventBits_t bits = xEventGroupWaitBits(s_wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+        if ((bits & WIFI_CONNECTED_BIT) == 0) {
+            // Connection failed; start SoftAP + portal and block
+            start_portal_and_block(&u8g2);
+        }
 
-    // MQTT client setup
-    esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = CONFIG_MQTT_BROKER_URI,
-    };
-    s_mqtt = esp_mqtt_client_init(&mqtt_cfg);
-    if (s_mqtt) {
-        esp_mqtt_client_start(s_mqtt);
+        if (!s_skip_no_mqtt) {
+            draw_status(&u8g2, "Wi-Fi connected", NULL);
+
+            // MQTT client setup
+            esp_mqtt_client_config_t mqtt_cfg = {
+                .broker.address.uri = CONFIG_MQTT_BROKER_URI,
+            };
+            s_mqtt = esp_mqtt_client_init(&mqtt_cfg);
+            if (s_mqtt) {
+                esp_mqtt_client_start(s_mqtt);
+            }
+        }
+    } else {
+        draw_status(&u8g2, "Bypass: No Wi-Fi/MQTT", NULL);
     }
 
     while (1) {
@@ -322,7 +477,7 @@ void app_main(void) {
         u8g2_DrawXBM(&u8g2, 80, 8, 48, 48, humidity_bitmap);
         u8g2_SendBuffer(&u8g2);
 
-        ESP_LOGI(TAG, "T=%.2fC RH=%.2f%%", temp, hum);
+        ESP_LOGI(TAG, "T=%.2fC H=%.2f%%", temp, hum);
         mqtt_publish(temp, hum);
 
         // Wait 3 seconds with progress bar
