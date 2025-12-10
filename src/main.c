@@ -110,6 +110,9 @@ void app_main(void) {
         float temp, hum;
         sensor_read(&temp, &hum);
 
+        ESP_LOGI(TAG, "T=%.2fC H=%.2f%%", temp, hum);
+        mqtt_publish_values(temp, hum, CONFIG_MQTT_TOPIC);
+
         // Display temperature
         u8g2_ClearBuffer(&u8g2);
         u8g2_SetFont(&u8g2, u8g2_font_ncenB14_tr);
@@ -183,9 +186,6 @@ void app_main(void) {
         // Display bitmap humidity
         u8g2_DrawXBM(&u8g2, 80, 8, 48, 48, humidity_bitmap);
         u8g2_SendBuffer(&u8g2);
-
-        ESP_LOGI(TAG, "T=%.2fC H=%.2f%%", temp, hum);
-        mqtt_publish_values(temp, hum, CONFIG_MQTT_TOPIC);
 
         // Wait 3 seconds with progress bar
         display_progress_bar(&u8g2);
