@@ -1,6 +1,6 @@
 ﻿/**
  * Author: Jakub Lůčný (xlucnyj00)
- * Date: 9.12.2025
+ * Date: 10.12.2025
  * 
  * VUT FIT IMP 2025
  */
@@ -11,33 +11,24 @@
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
-#include "driver/i2c.h"
-#include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_event.h"
-#include "nvs_flash.h"
-#include "esp_wifi.h"
-#include "esp_netif.h"
-#include "esp_mac.h"
 #include "esp_system.h"
 #include "u8g2.h"
-#include "mqtt_client.h"
-#include "esp_http_server.h"
-#include "esp_netif_ip_addr.h"
-#include "lwip/ip4_addr.h"
+#include "esp_wifi.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
 
-// TODO: for init codes make separate functions
+#include "i2c_bus.h"
+#include "display.h"
+#include "wifi.h"
+#include "portal.h"
+#include "sensor.h"
+#include "mqtt.h"
 
 #define TAG "Meteostation"
 
-#define I2C_PORT    I2C_NUM_0
-#define I2C_SDA_PIN 21
-#define I2C_SCL_PIN 22
-#define I2C_FREQ    CONFIG_I2C_MASTER_FREQUENCY
 #define DISPLAY_ADDR CONFIG_I2C_DISPLAY_ADDRESS
-
-#define SHT31_ADDR 0x44     //< SHT31 I2C address
 
 #ifndef CONFIG_AP_SSID
 #define CONFIG_AP_SSID "ESP_Config"
@@ -52,287 +43,6 @@
 #define CONFIG_MQTT_TOPIC "meteostanice/measurements"
 #endif
 
-static EventGroupHandle_t s_wifi_event_group;
-static const int WIFI_CONNECTED_BIT = BIT0;
-static esp_mqtt_client_handle_t s_mqtt = NULL;
-static httpd_handle_t s_http = NULL;
-static esp_netif_t *s_ap_netif = NULL;
-static volatile bool s_skip_no_mqtt = false; // set when user chooses to run without MQTT via portal
-
-// S---------------------------------------
-static void init_nvs(void) {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-      ESP_ERROR_CHECK(nvs_flash_erase());
-        ESP_ERROR_CHECK(nvs_flash_init());
-    }
-}
-// E---------------------------------------
-
-static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
-    if (base == WIFI_EVENT) {
-        switch (id) {
-            case WIFI_EVENT_STA_START:
-                esp_wifi_connect();
-                break;
-            case WIFI_EVENT_STA_DISCONNECTED:
-                xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-                esp_wifi_connect();
-                break;
-            default:
-                break;
-        }
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    }
-}
-
-// S---------------------------------------
-static void init_wifi_sta(void) {
-    s_wifi_event_group = xEventGroupCreate();
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
-}
-// E---------------------------------------
-
-
-static bool load_wifi_creds(char *out_ssid, size_t ssid_len, char *out_pass, size_t pass_len) {
-    nvs_handle_t nvh;
-    if (nvs_open("wifi", NVS_READONLY, &nvh) != ESP_OK) return false;
-    size_t len_ssid = ssid_len;
-    size_t len_pass = pass_len;
-    esp_err_t er1 = nvs_get_str(nvh, "ssid", out_ssid, &len_ssid);
-    esp_err_t er2 = nvs_get_str(nvh, "pass", out_pass, &len_pass);
-    nvs_close(nvh);
-    if (er1 == ESP_OK && er2 == ESP_OK && out_ssid[0] != '\0') return true;
-    return false;
-}
-
-static esp_err_t root_get_handler(httpd_req_t *req) {
-    const char *html =
-        "<html><head><meta name=viewport content=\"width=device-width, initial-scale=1\"></head><body>"
-        "<h3>Wi-Fi Setup</h3>"
-        "<form method='POST' action='/save'>"
-        "SSID: <input name='ssid'><br>"
-        "Password: <input name='pass' type='password'><br>"
-        "<button type='submit'>Save</button>"
-        "</form>"
-        "<hr>"
-        "<form method='GET' action='/skip'>"
-        "<button type='submit'>Run without MQTT</button>"
-        "</form>"
-        "<p>This starts the thermometer without Wi‑Fi/MQTT.</p>"
-        "</body></html>";
-    httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
-}
-
-// Minimal URL decoder for '+' and %HH used after query extraction
-static void urldecode(char *s) {
-    char *src = s, *dst = s;
-    while (*src) {
-        if (*src == '+') { *dst++ = ' '; src++; }
-        else if (*src == '%' && src[1] && src[2]) {
-            int hi = src[1];
-            int lo = src[2];
-            hi = (hi >= '0' && hi <= '9') ? hi - '0' : (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10 : -1;
-            lo = (lo >= '0' && lo <= '9') ? lo - '0' : (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10 : -1;
-            if (hi >= 0 && lo >= 0) { *dst++ = (char)((hi << 4) | lo); src += 3; }
-            else { *dst++ = *src++; }
-        } else { *dst++ = *src++; }
-    }
-    *dst = '\0';
-}
-
-static esp_err_t save_post_handler(httpd_req_t *req) {
-    char buf[160];
-    int received = httpd_req_recv(req, buf, sizeof(buf) - 1);
-    if (received <= 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No data");
-        return ESP_FAIL;
-    }
-    buf[received] = '\0';
-    char ssid[64] = {0}, pass[64] = {0};
-
-    /* httpd_query_key_value works on any key=value&key2=value2 string.
-       For application/x-www-form-urlencoded POST bodies, we can reuse it
-       to extract decoded values without custom parsing. */
-    (void)httpd_query_key_value(buf, "ssid", ssid, sizeof(ssid));
-    (void)httpd_query_key_value(buf, "pass", pass, sizeof(pass));
-    urldecode(ssid);
-    urldecode(pass);
-
-    ESP_LOGI(TAG, "Saving Wi-Fi credentials: SSID='%s', PASS='%s'", ssid, pass);
-
-    nvs_handle_t nvh;
-    if (nvs_open("wifi", NVS_READWRITE, &nvh) == ESP_OK) {
-        nvs_set_str(nvh, "ssid", ssid);
-        nvs_set_str(nvh, "pass", pass);
-        nvs_commit(nvh);
-        nvs_close(nvh);
-    }
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, "<p>Saved. Rebooting...</p>", HTTPD_RESP_USE_STRLEN);
-    vTaskDelay(pdMS_TO_TICKS(300));
-    esp_restart();
-    return ESP_OK;
-}
-
-static esp_err_t skip_get_handler(httpd_req_t *req) {
-    s_skip_no_mqtt = true;
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, "<p>Starting without MQTT...</p>", HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
-}
-
-static void start_config_portal(void) {
-    s_ap_netif = esp_netif_create_default_wifi_ap();
-    // 192.168.4.1/24
-    esp_netif_ip_info_t ip_info = {0};
-    ip4_addr_t t;
-    IP4_ADDR(&t, 192, 168, 4, 1); ip_info.ip.addr = t.addr;
-    IP4_ADDR(&t, 192, 168, 4, 1); ip_info.gw.addr = t.addr;
-    IP4_ADDR(&t, 255, 255, 255, 0); ip_info.netmask.addr = t.addr;
-    esp_netif_dhcps_stop(s_ap_netif);
-    ESP_ERROR_CHECK(esp_netif_set_ip_info(s_ap_netif, &ip_info));
-    ESP_ERROR_CHECK(esp_netif_dhcps_start(s_ap_netif));
-
-    wifi_config_t ap_cfg = {0};
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    char ap_ssid[32];
-    snprintf(ap_ssid, sizeof(ap_ssid), "%s-%02X%02X", CONFIG_AP_SSID, mac[4], mac[5]);
-    strncpy((char*)ap_cfg.ap.ssid, ap_ssid, sizeof(ap_cfg.ap.ssid) - 1);
-    ap_cfg.ap.ssid_len = strlen((char*)ap_cfg.ap.ssid);
-    ap_cfg.ap.channel = 1;
-    ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
-    ap_cfg.ap.max_connection = 4;
-    ap_cfg.ap.beacon_interval = 100;
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    httpd_config_t conf = HTTPD_DEFAULT_CONFIG();
-    conf.server_port = 80;
-    ESP_ERROR_CHECK(httpd_start(&s_http, &conf));
-
-    httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
-    httpd_register_uri_handler(s_http, &root);
-    httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler, .user_ctx = NULL };
-    httpd_register_uri_handler(s_http, &save);
-    httpd_uri_t skip = { .uri = "/skip", .method = HTTP_GET, .handler = skip_get_handler, .user_ctx = NULL };
-    httpd_register_uri_handler(s_http, &skip);
-}
-
-static void draw_status(u8g2_t *u8g2, const char *line1, const char *line2) {
-    u8g2_ClearBuffer(u8g2);
-    u8g2_SetFont(u8g2, u8g2_font_6x10_tf);
-    if (line1) u8g2_DrawStr(u8g2, 2, 14, line1);
-    if (line2) u8g2_DrawStr(u8g2, 2, 28, line2);
-    u8g2_SendBuffer(u8g2);
-}
-
-static void start_portal_and_block(u8g2_t *u8g2) {
-    draw_status(u8g2, "Open portal", "Connect to AP");
-    if (s_http) { httpd_stop(s_http); s_http = NULL; }
-    start_config_portal();
-    char line1[40];
-    snprintf(line1, sizeof(line1), "SSID: %s", CONFIG_AP_SSID);
-    draw_status(u8g2, line1, "http://192.168.4.1");
-    while (!s_skip_no_mqtt) { vTaskDelay(pdMS_TO_TICKS(200)); }
-    if (s_http) { httpd_stop(s_http); s_http = NULL; }
-    if (s_ap_netif) {
-        esp_wifi_stop();
-        esp_wifi_set_mode(WIFI_MODE_NULL);
-        esp_netif_destroy(s_ap_netif);
-        s_ap_netif = NULL;
-    }
-}
-
-static uint8_t i2c_buffer[256];
-static i2c_master_bus_handle_t s_i2c_bus = NULL;
-static i2c_master_dev_handle_t s_i2c_oled = NULL;
-static i2c_master_dev_handle_t s_i2c_sht31 = NULL;
-
-static uint8_t u8g2_esp32_i2c_byte_cb(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr) {
-    static size_t index = 0;
-    switch(msg) {
-        case U8X8_MSG_BYTE_INIT: index = 0; break;
-        case U8X8_MSG_BYTE_START_TRANSFER: index = 0; break;
-        case U8X8_MSG_BYTE_SEND:
-            if (arg_int > 0 && (index + arg_int) < sizeof(i2c_buffer)) {
-                memcpy(&i2c_buffer[index], arg_ptr, arg_int);
-                index += arg_int;
-            }
-            break;
-        case U8X8_MSG_BYTE_END_TRANSFER:
-            if (index > 0 && s_i2c_oled) {
-                (void)i2c_master_transmit(s_i2c_oled, i2c_buffer, index, 1000);
-            }
-            break;
-        default: return 0;
-    }
-    return 1;
-}
-
-static void sht31_read(float *temp_c, float *rh) {
-    const uint8_t cmd[2] = { 0x24, 0x00 }; // single-shot, high repeatability
-    if (!s_i2c_sht31) { *temp_c = 0; *rh = 0; return; }
-
-    // Send measurement command
-    esp_err_t err = i2c_master_transmit(s_i2c_sht31, cmd, sizeof(cmd), 1000);
-    if (err != ESP_OK) { *temp_c = 0; *rh = 0; return; }
-
-    // Wait for measurement to be ready (datasheet ~15ms; use 30ms)
-    vTaskDelay(pdMS_TO_TICKS(30));
-
-    // Read 6 bytes: T(2) + CRC + RH(2) + CRC
-    uint8_t raw[6] = {0};
-    err = i2c_master_receive(s_i2c_sht31, raw, sizeof(raw), 1000);
-    if (err != ESP_OK) { *temp_c = 0; *rh = 0; return; }
-    
-    uint16_t st = ((uint16_t)raw[0] << 8) | raw[1];
-    uint16_t srh = ((uint16_t)raw[3] << 8) | raw[4];
-    *temp_c = -45.0f + 175.0f * ((float)st / 65535.0f);
-    *rh = 100.0f * ((float)srh / 65535.0f);
-}
-
-static uint8_t u8g2_esp32_gpio_delay_cb(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr) {
-    switch(msg) {
-        case U8X8_MSG_DELAY_MILLI: vTaskDelay(pdMS_TO_TICKS(arg_int)); break;
-        case U8X8_MSG_DELAY_10MICRO: vTaskDelay(1); break;
-        default: return 1;
-    }
-    return 1;
-}
-
-static void display_progress_bar(u8g2_t *u8g2) {
-    /* Progress bar frame */
-    u8g2_DrawFrame(u8g2, 10, 60, 108, 4);
-
-    for (int progress = 0; progress <= 100; progress += 5) {
-        /* Progress bar fill */
-        int fill_width = (progress * 106) / 100;
-        u8g2_DrawBox(u8g2, 11, 61, fill_width, 2);
-
-        u8g2_SendBuffer(u8g2);
-        vTaskDelay(pdMS_TO_TICKS(75));
-    }
-}
-
-static void mqtt_publish(float temp, float hum) {
-    if (!s_mqtt) return;
-    char payload[128];
-    snprintf(payload, sizeof(payload), "{\"temp_c\":%.2f,\"hum\":%.2f}", temp, hum);
-    esp_mqtt_client_publish(s_mqtt, CONFIG_MQTT_TOPIC, payload, 0, 1, 0);
-}
-
 /****************************************************************************
     Main application entry point
 ****************************************************************************/
@@ -341,102 +51,62 @@ void app_main(void) {
     // ESP_LOGD(TAG, "TESTING: Erasing NVS!");
     // ESP_ERROR_CHECK(nvs_flash_erase());
 
-    init_nvs();
-    init_wifi_sta();
+    nvs_init();
+    wifi_sta_init();
+    i2c_bus_init();
 
-    // TODO: check or maybe update (its different then in examples)
-    // Configure I2C using new master bus API
-    i2c_master_bus_config_t bus_cfg = {
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .i2c_port = I2C_PORT,
-        .scl_io_num = I2C_SCL_PIN,
-        .sda_io_num = I2C_SDA_PIN,
-        .glitch_ignore_cnt = 7,
-        .flags = {.enable_internal_pullup = true},
-    };
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &s_i2c_bus));
-
-    i2c_device_config_t oled_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = DISPLAY_ADDR,
-        .scl_speed_hz = I2C_FREQ,
-    };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus, &oled_cfg, &s_i2c_oled));
-
-    i2c_device_config_t sht_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = SHT31_ADDR,
-        .scl_speed_hz = I2C_FREQ,
-    };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(s_i2c_bus, &sht_cfg, &s_i2c_sht31));
-
-    // S---------------------------------------
-
-    // Initialize OLED
     u8g2_t u8g2;
-    u8g2_Setup_ssd1306_i2c_128x64_noname_f(
-        &u8g2, U8G2_R0,
-        u8g2_esp32_i2c_byte_cb,
-        u8g2_esp32_gpio_delay_cb
-    );
-    u8x8_SetI2CAddress(&u8g2.u8x8, DISPLAY_ADDR << 1);
-    u8g2_InitDisplay(&u8g2);
-    u8g2_SetPowerSave(&u8g2, 0);
+    display_init(&u8g2, DISPLAY_ADDR);
 
-    // E---------------------------------------
-
-    // Load stored credentials from NVS
+    // Try to load stored credentials from NVS
     char ssid[64] = {0}, pass[64] = {0};
-    bool have_nvs = load_wifi_creds(ssid, sizeof(ssid), pass, sizeof(pass));
+    bool have_nvs = wifi_load_creds(ssid, sizeof(ssid), pass, sizeof(pass));
     if (!have_nvs) {
         // No credentials found; start config portal
-        start_portal_and_block(&u8g2);
+        portal_run_blocking(&u8g2);
     }
 
-    if (!s_skip_no_mqtt) {
+    if (!portal_skip_no_mqtt) {
         // Try Wi‑Fi STA connect; if fails, open config portal
         wifi_config_t sta = {0};
         strncpy((char*)sta.sta.ssid, ssid, sizeof(sta.sta.ssid));
         strncpy((char*)sta.sta.password, pass, sizeof(sta.sta.password));
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
-        ESP_ERROR_CHECK(esp_wifi_start());
-        draw_status(&u8g2, "Wi-Fi connecting...", NULL);
-        EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                WIFI_CONNECTED_BIT,
+
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        esp_wifi_set_config(WIFI_IF_STA, &sta);
+        esp_wifi_start();
+
+        display_draw_status(&u8g2, "Wi-Fi connecting...", NULL);
+
+        EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
+                BIT0,
                 pdFALSE,
                 pdFALSE,
                 pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS)
         );
-        if ((bits & WIFI_CONNECTED_BIT) == 0) {
+        if ((bits & BIT0) == 0) {
             // Connection failed; start SoftAP + portal and block
-            start_portal_and_block(&u8g2);
+            portal_run_blocking(&u8g2);
         }
 
-        if (!s_skip_no_mqtt) {
-            draw_status(&u8g2, "Wi-Fi connected", NULL);
-
-            // MQTT client setup
-            esp_mqtt_client_config_t mqtt_cfg = {
-                .broker.address.uri = CONFIG_MQTT_BROKER_URI,
-            };
-            s_mqtt = esp_mqtt_client_init(&mqtt_cfg);
-            if (s_mqtt) {
-                esp_mqtt_client_start(s_mqtt);
-            }
+        if (!portal_skip_no_mqtt) {
+            // Connected; start MQTT client
+            display_draw_status(&u8g2, "Wi-Fi connected", NULL);
+            mqtt_start(CONFIG_MQTT_BROKER_URI);
         }
     } else {
-        draw_status(&u8g2, "Started without data export", NULL);
+        display_draw_status(&u8g2, "Started without data export", NULL);
     }
+
+    sensor_init();
 
     /* Main application loop 
         reads temperature and humidity data from sensor, displays it and publishes via MQTT
         cycle repeats every 6 seconds
     */ 
     while (1) {
-        // Read SHT31
         float temp, hum;
-        sht31_read(&temp, &hum);
+        sensor_read(&temp, &hum);
 
         // Display temperature
         u8g2_ClearBuffer(&u8g2);
@@ -513,7 +183,7 @@ void app_main(void) {
         u8g2_SendBuffer(&u8g2);
 
         ESP_LOGI(TAG, "T=%.2fC H=%.2f%%", temp, hum);
-        mqtt_publish(temp, hum);
+        mqtt_publish_values(temp, hum, CONFIG_MQTT_TOPIC);
 
         // Wait 3 seconds with progress bar
         display_progress_bar(&u8g2);
