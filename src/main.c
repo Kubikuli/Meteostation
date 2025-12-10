@@ -65,9 +65,8 @@ void app_main(void) {
         // No credentials found; start config portal
         portal_run_blocking(&u8g2);
     }
-
-    if (!portal_skip_no_mqtt) {
-        // Try Wi‑Fi STA connect; if fails, open config portal
+    else {
+        // Found credentials, try to connect; if fails, open config portal
         wifi_config_t sta = {0};
         strncpy((char*)sta.sta.ssid, ssid, sizeof(sta.sta.ssid));
         strncpy((char*)sta.sta.password, pass, sizeof(sta.sta.password));
@@ -84,8 +83,9 @@ void app_main(void) {
                 pdFALSE,
                 pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS)
         );
+
         if ((bits & BIT0) == 0) {
-            // Connection failed; start SoftAP + portal and block
+            // Connection failed; start SoftAP + portal
             portal_run_blocking(&u8g2);
         }
 
@@ -94,7 +94,9 @@ void app_main(void) {
             display_draw_status(&u8g2, "Wi-Fi connected", NULL);
             mqtt_start(CONFIG_MQTT_BROKER_URI);
         }
-    } else {
+    }
+
+    if (portal_skip_no_mqtt) {
         display_draw_status(&u8g2, "Started without data export", NULL);
     }
 
@@ -102,7 +104,7 @@ void app_main(void) {
 
     /* Main application loop 
         reads temperature and humidity data from sensor, displays it and publishes via MQTT
-        cycle repeats every 6 seconds
+        cycle repeats every ~6 seconds
     */ 
     while (1) {
         float temp, hum;
