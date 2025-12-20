@@ -1,0 +1,167 @@
+\documentclass[a4paper,12pt]{article}
+\usepackage[czech]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{amsmath}
+\usepackage{geometry}
+\geometry{
+  a4paper,
+  left=25mm,
+  right=25mm,
+  top=25mm,
+  bottom=25mm,
+}
+
+\begin{document}
+
+\begin{titlepage}
+    \centering
+    \includegraphics[scale=0.1,keepaspectratio]{images/logo_cz.png} \\
+    \vspace{\stretch{0,381966}}
+    {\LARGE Dokumentace k projektu \\
+    \vspace{0.5em}}
+    {\LARGE \textbf{Meteostanice}} \\
+    {\LARGE Mikroprocesorové a vestavěné systémy - IMP\\
+    \vspace{0.5em}}
+    \vspace{\stretch{0,618034}}
+    \begin{minipage}[t]{0.4\textwidth}
+        \vspace{1.5em}
+        \raggedright
+        {\Large \today}
+    \end{minipage}%
+    \hfill
+    \begin{minipage}[t]{0.4\textwidth}
+        \vspace{1.5em}
+        \raggedleft
+        \Large Jakub Lůčný (xlucnyj00)
+    \end{minipage}
+\end{titlepage}
+
+
+\tableofcontents
+\newpage
+
+\section{Úvod}
+Dokumentace popisuje návrh a implementaci meteostanice pro zobrazení informací o teplotě a vlhkosti vzduchu s využitím vývojové desky ESP32, senzoru SHT31 a OLED displeje. Program také umožňuje volitelně se připojit na WiFi síť a odesílat naměřené hodnoty pomocí protokolu MQTT.
+
+\subsection{Použité technologie}
+\textbf{Hardware:}
+\begin{itemize}
+    \item Vývojová deska \textbf{ESP32}
+    \item Senzor teploty a vlhkosti \textbf{SHT31} - pro měření hodnot
+    \item \textbf{OLED displej} - pro zobrazení naměřených hodnot
+\end{itemize}
+
+\noindent
+\textbf{Software:}
+\begin{itemize}
+    \item \textbf{ESP-IDF} framework s \textbf{PlatformIO} rozšířením pro VSCode
+    \item \textbf{u8g2} knihovna pro ovládání displeje
+    \item \textbf{HiveMQ Public Broker} - veřejně dostupný MQTT broker, na který zařízení posílá naměřená data
+    \item \textbf{MQTT Explorer} - pro zobrazení dat, která byla odeslána na HiveMQ Broker
+\end{itemize}
+
+
+\section{Návrh}
+Tato sekce popisuje celkový návrh řešení problému od zapojení jednotlivých periferií až po hlavní tok programu. 
+
+\subsection{Zapojení}
+Komunikace s oběma periferiemi probíhá přes I2C sběrnici. Tedy obě periferie jsou připojeny ke zdroji napětí 3.3V a uzemnění na vývojové desce a dále obě periferie sdílí připojení jejich datového SDA pinu k SDA pinu 21 desky a také připojení SCL pinu pro zdroj hodin této komunikace a to k pinu 22 desky.
+
+\subsection{Hlavní tok programu}
+\begin{enumerate}
+    \item \textbf{Spuštění:} při spuštění se jako první inicializují jednotlivé komponenty jako \texttt{NVS} úložiště (Non-volatile storage), I2C sběrnice, displej a WiFi. 
+    \item \textbf{WiFi:} hned poté se pokusí zařízení přihlásit na WiFi síť, jejíž údaje má uložené v \texttt{NVS}.
+    \begin{enumerate}[label*=\arabic*.]
+        \item \textbf{Konfigurace WiFi:} pokud se nepodaří přihlásit nebo zařízení nemá uložené žádné předešlé údaje, spustí "WiFi přístupový bod" (AP) a portál pro zadání údajů a zobrazí informace o portálu na displeji.
+        \item \textbf{Portál:} pro přístup ke konfiguračnímu portálu se musí uživatel připojit k přístupovému bodu desky a spustit prohlížeč s adresou uvedenou na displeji. Poté má možnost buď zadat SSID a heslo od WiFi nebo vybrat možnost spuštění bez připojení k internetu. 
+    \end{enumerate}
+    \item \textbf{Měření:} poté už se inicializuje samotný senzor a spustí se nekonečná smyčka programu.
+    \item \textbf{Nekonečná smyčka:} ve smyčce se přibližně každých 6 sekund opakuje - získání naměřených údajů, odeslání dat na MQTT broker (pokud je zařízení připojeno k internetu), zobrazení teploty na 3 sekundy a nakonec zobrazení vlhkosti vzduchu na další 3 sekundy. Zobrazované hodnoty jsou doplněny o ikonky a \textit{progressbar}.
+\end{enumerate}
+
+
+\begin{figure}[h!]
+    \centering
+    \includegraphics[scale=0.5]{images/IMP_flowchart.png}
+    \caption{Flow diagram programu}
+\end{figure}
+
+
+\section{Implementační detaily}
+Implementace je realizována za pomocí \texttt{ESP-IDF} frameworku a z velké části se opírá o veřejně dostupné příklady\cite{esp_idf_examples}, odkud byla převzata a mírně poupravena značná část projektu, a to převážně co se inicializace a správného nastavení jednotlivých komponent týká. \\
+
+Implementace je rozdělena do několika souborů. Většina vlastního autorského kódu se nachází v souboru \texttt{main.c}, ostatní soubory obsahují převážně převzaté a mírně upravené kusy kódu z již zmíněných veřejných příkladů\cite{esp_idf_examples}.\\
+
+Pro ovládání displeje byla použita knihovna \textbf{u8g2}, která umožňuje snadné zobrazování jak textu, tak i například grafických ikonek apod. \\
+
+Údaje jsou na displeji zobrazovány společně s ikonkou a \textit{progressbarem}. Ikonky byly převzaty jako volně dostupné a pomocí nástroje\cite{image2cpp} převedeny do bitmapové reprezentace, kterou následně zobrazí knihovna pro ovládání displeje. \textit{Progressbar} zobrazuje čas do přepnutí na další údaj. \\
+
+Převedení hodnot získaných ze senzoru na odpovídající údaje o teplotě a vlhkosti bylo podle následujících vzorců\cite{sht3x_datasheet}:
+$$T \text{ [}^\circ\text{C]}= -45 + 175 \cdot \frac{S_T}{2^{16} - 1}$$
+$$RH = 100 \cdot \frac{S_{RH}}{2^{16} - 1}$$\\
+
+Data jsou odesílána pomocí MQTT na adresu brokeru \texttt{mqtt://broker.hivemq.com:1883} jako \textit{téma} \textit{(topic)} \texttt{meteostanice/measurements}. Tyto přednastavené hodnoty se dají změnit definováním příslušných maker nebo změněním hodnoty těchto maker na začátku souboru \texttt{main.c}. Data jsou odesílána ve formátu \texttt{JSON}. Příklad formátu dat:
+\begin{verbatim}
+{
+  "temp_c": 22.18,
+  "hum": 67.8
+}
+\end{verbatim}
+
+\subsection{Struktura programu}
+Program se skládá z následujících částí:
+\begin{itemize}
+  \item \texttt{display.c}, \texttt{display.h} - inicializace a obsluha displeje, funkce pro vykreslování
+  \item \texttt{i2c\_bus.c}, \texttt{i2c\_bus.h} - inicializace I2C sběrnice
+  \item \texttt{main.c} - hlavní modul, řízení programu
+  \item \texttt{mqtt.c}, \texttt{mqtt.h} - inicializace mqtt klienta a publikování hodnot
+  \item \texttt{portal.c}, \texttt{portal.h} - nastavení a ovládání konfiguračního portálu
+  \item \texttt{sensor.c}, \texttt{sensor.h} - inicializace senzoru a čtení hodnot
+  \item \texttt{wifi.c}, \texttt{wifi.h} - inicializace wifi a nvs modulu, načtení přihlašovacích údajů
+\end{itemize}
+
+
+\section{Závěr}
+Meteostanici se podařilo implementovat podle návrhu a nejsou známy žádné chyby či nedostatky. Řešení by bylo snadné případně rozšířit o snímání a zobrazování i dalších hodnot. Díky exportu dat je možná další vizualizace či jiné zpracování naměřených hodnot. Implementace je dostatečně robustní a i uživatelsky přívětivá díky informacím o aktuálním stavu zobrazovaným na displeji v průběhu konfigurace připojení.\\
+Program demonstruje jak základní snímání hodnot z digitálního senzoru, tak jednoduchou i pokročilejší vizualizaci grafiky na displeji, ale i použití WiFi přístupového bodu, WiFi připojení a MQTT protokolu pro přenos dat. Mimo to projekt také zahrnoval základní propojení I2C periferií a správné nastavení I2C sběrnice pro komunikaci. 
+
+
+
+\newpage
+\section{Použitá literatura}
+\vspace{-2.5em}
+
+\renewcommand{\refname}{}  % Suppress automatic "References" title
+\begin{thebibliography}{9}
+
+\bibitem{esp_idf_examples}
+Espressif Systems.
+ESP-IDF Examples.
+Available: \url{https://github.com/espressif/esp-idf/blob/master/examples}
+
+\bibitem{lastminute_oled}
+Last Minute Engineers.
+ESP32 OLED Display with Arduino IDE.
+Available: \url{https://lastminuteengineers.com/oled-display-esp32-tutorial/}
+
+\bibitem{hivemq_mqtt}
+HiveMQ.
+Introducing the MQTT Protocol -- MQTT Essentials: Part 1.
+Available: \url{https://www.hivemq.com/blog/how-to-get-started-with-mqtt/}
+
+\bibitem{sht3x_datasheet}
+Sensirion.
+Datasheet SHT3x.
+Available: \url{https://www.laskakit.cz/user/related_files/sht3x.pdf}
+
+\bibitem{image2cpp}
+javl.
+image2cpp.
+Available: \url{https://javl.github.io/image2cpp/}
+\end{thebibliography}
+
+\end{document}
